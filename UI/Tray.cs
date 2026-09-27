@@ -20,6 +20,8 @@ sealed class TrayApp : ApplicationContext
     readonly MainForm _form;
     readonly EventWaitHandle _showSignal;
     readonly RegisteredWaitHandle _showWait;
+    readonly EventWaitHandle _exitSignal;
+    readonly RegisteredWaitHandle _exitWait;
     readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
     readonly Dictionary<Profile, ToolStripMenuItem> _profileItems = [];
     readonly ToolStripMenuItem _autostartItem;
@@ -130,6 +132,10 @@ sealed class TrayApp : ApplicationContext
         _showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
         _showWait = ThreadPool.RegisterWaitForSingleObject(
             _showSignal, (_, _) => _form.BeginInvoke(new Action(ShowWindow)), null, Timeout.Infinite, false);
+        // "FanDeck.exe --exit" (used when updating) closes this copy cleanly, handing the fans back to the BIOS.
+        _exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ExitEventName);
+        _exitWait = ThreadPool.RegisterWaitForSingleObject(
+            _exitSignal, (_, _) => _form.BeginInvoke(new Action(Exit)), null, Timeout.Infinite, true);
 
         _timer.Tick += (_, _) => OnTick();
         _timer.Start();
@@ -276,6 +282,9 @@ sealed class TrayApp : ApplicationContext
     void StartFanControl(FanHardware hw)
     {
         _hw = hw;
+        // Curves used to be shared by all fans; give each fan its own copy the first time the fans are known.
+        if (_cfg.MigrateSharedCurves(hw.Channels.Where(c => c.Connected).Select(c => c.Id)))
+            _cfg.Save();
         _loop = new FanLoop(hw, _cfg);
     }
 
@@ -416,6 +425,7 @@ sealed class TrayApp : ApplicationContext
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         SystemEvents.SessionEnding -= OnSessionEnding;
         _showWait.Unregister(null);
+        _exitWait.Unregister(null);
         StopFanControl();
         _aura?.Dispose();
         _tray.Visible = false;
@@ -430,6 +440,7 @@ sealed class TrayApp : ApplicationContext
             _tray.Dispose();
             _timer.Dispose();
             _showSignal.Dispose();
+            _exitSignal.Dispose();
         }
         base.Dispose(disposing);
     }

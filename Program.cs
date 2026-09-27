@@ -6,6 +6,7 @@ static class Program
 {
     const string MutexName = @"Local\FanDeck.SingleInstance";
     public const string ShowEventName = @"Local\FanDeck.Show";
+    public const string ExitEventName = @"Local\FanDeck.Exit";
 
     /// <summary>Set by the tray app: hands the fans back to the BIOS if the process is going down.</summary>
     public static Action? EmergencyRelease;
@@ -15,6 +16,21 @@ static class Program
     {
         if (args.Length > 0 && args[0].Equals("--detect", StringComparison.OrdinalIgnoreCase))
             return Detect.Run(args.Length > 1 ? args[1] : null);
+
+        if (args.Length > 0 && args[0].Equals("--exit", StringComparison.OrdinalIgnoreCase))
+        {
+            // Ask the running copy to close cleanly (fans back to the BIOS). Exit code 1: nothing was running.
+            try
+            {
+                using var exit = EventWaitHandle.OpenExisting(ExitEventName);
+                exit.Set();
+                return 0;
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                return 1;
+            }
+        }
 
         using var mutex = new Mutex(true, MutexName, out bool firstInstance);
         if (!firstInstance)

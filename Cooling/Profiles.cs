@@ -5,6 +5,32 @@ public enum Profile { Silent, Balanced, Performance, Max, Manual }
 /// <summary>One point on a fan curve: at <see cref="Temp"/> °C the fans run at <see cref="Percent"/> %.</summary>
 public readonly record struct CurvePoint(float Temp, float Percent);
 
+/// <summary>Which temperature a fan's curve reads.</summary>
+public enum TempSource { Cpu, Gpu, Hottest }
+
+public static class TempSources
+{
+    public static readonly TempSource[] All = [TempSource.Cpu, TempSource.Gpu, TempSource.Hottest];
+
+    public static string Label(TempSource source) => source switch
+    {
+        TempSource.Cpu => "CPU temperature",
+        TempSource.Gpu => "GPU temperature",
+        _ => "Hotter of CPU and GPU",
+    };
+
+    /// <summary>
+    /// The temperature a fan should follow. Falls back to the CPU when the GPU can't be read;
+    /// null only when the CPU can't be read either (the fan loop then runs the fan flat out).
+    /// </summary>
+    public static float? Read(TempSource source, float? cpu, float? gpu) => source switch
+    {
+        TempSource.Gpu => gpu ?? cpu,
+        TempSource.Hottest => cpu is null ? null : gpu is null ? cpu : Math.Max(cpu.Value, gpu.Value),
+        _ => cpu,
+    };
+}
+
 /// <summary>Temperature (°C) to fan-speed (%) curves.</summary>
 public static class Profiles
 {

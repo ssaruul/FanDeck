@@ -26,6 +26,8 @@ sealed class MainForm : Form
     readonly TableLayoutPanel _banner;
     readonly Label _temps;
     readonly Label _profileHint;
+    readonly FlowLayoutPanel _graphFans;
+    readonly ComboBox _source;
     readonly CurveGraph _graph;
     readonly Label _graphHint;
     readonly LinkLabel _resetCurve;
@@ -43,6 +45,8 @@ sealed class MainForm : Form
 
     LoopSnapshot? _last;
     string _fanLayout = "";
+    string _graphFanLayout = "";
+    string? _graphFan; // id of the fan whose curve the graph shows and edits
     Profile? _shownProfile;
     Color _color;
     bool _syncing;
@@ -130,11 +134,32 @@ sealed class MainForm : Form
         _profileHint = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = Pad(0, 6, 0, 6) };
         root.Controls.Add(_profileHint);
 
-        // Fan curve graph for the active profile.
+        // Which fan the graph edits, and which temperature that fan follows.
+        var graphHeader = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Pad(0, 0, 0, 4) };
+        _graphFans = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Pad(0, 0, 10, 0) };
+        _source = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = Px(190), Margin = Pad(0, 3, 0, 0) };
+        foreach (var source in TempSources.All)
+            _source.Items.Add(TempSources.Label(source));
+        _source.SelectedIndexChanged += (_, _) =>
+        {
+            if (_syncing || _graphFan is null || _source.SelectedIndex < 0)
+                return;
+            _cfg.Fan(_graphFan).Source = TempSources.All[_source.SelectedIndex];
+            _cfg.Save();
+            _app.Loop?.Poke();
+        };
+        graphHeader.Controls.Add(_graphFans);
+        graphHeader.Controls.Add(new Label { Text = "follows", AutoSize = true, ForeColor = Color.DimGray, Margin = Pad(0, 7, 6, 0) });
+        graphHeader.Controls.Add(_source);
+        root.Controls.Add(graphHeader);
+
+        // The selected fan's curve for the active profile.
         _graph = new CurveGraph { Size = new Size(Px(580), Px(210)), Margin = Pad(0) };
         _graph.CurveEdited += points =>
         {
-            _cfg.SetCurve(_cfg.Profile, points);
+            if (_graphFan is null)
+                return;
+            _cfg.SetCurve(_cfg.Profile, _graphFan, points);
             _cfg.Save();
             _app.Loop?.Poke();
             ShowCurve();
@@ -145,7 +170,9 @@ sealed class MainForm : Form
         _resetCurve = new LinkLabel { Text = "Reset curve", AutoSize = true, Margin = Pad(0) };
         _resetCurve.LinkClicked += (_, _) =>
         {
-            _cfg.SetCurve(_cfg.Profile, null);
+            if (_graphFan is null)
+                return;
+            _cfg.SetCurve(_cfg.Profile, _graphFan, null);
             _cfg.Save();
             _app.Loop?.Poke();
             ShowCurve();
@@ -230,13 +257,18 @@ sealed class MainForm : Form
         foreach (var (p, button) in _profileButtons)
             button.Checked = p == profile;
         _profileHint.Text = Profiles.Describe(profile);
-        ShowCurve();
-        _graph.SetLive((s?.Fans ?? [])
-            .Where(f => f.Controlled && f.SourceTemp is not null)
-            .Select(f => new CurveGraph.LiveDot(f.Name, f.SourceTemp!.Value, f.Percent))
-            .ToList());
 
         var fans = s?.Fans ?? [];
+        var controlledFans = fans.Where(f => f.Controlled).ToList();
+        string graphLayout = string.Join("|", controlledFans.Select(f => $"{f.Id}={f.Name}"));
+        if (graphLayout != _graphFanLayout)
+        {
+            BuildGraphFans(controlledFans);
+            _graphFanLayout = graphLayout;
+        }
+        ShowCurve();
+        _graph.SetLive(LiveDots());
+
         string layout = string.Join("|", fans.Select(f => $"{f.Id}={f.Name}"));
         if (layout != _fanLayout)
         {
@@ -296,24 +328,97 @@ sealed class MainForm : Form
             return "No spinning fans found on the motherboard headers. Plug fans in, then press Rescan.";
         return manual
             ? "Drag the sliders. Fans stay at or above 20–25%, and every fan runs at full speed if the CPU reaches 95 °C."
-            : "Right-click a fan's name to rename it, choose which temperature it follows, or hand it to FanDeck if it shows BIOS.";
+            : "Click a fan's name to edit its curve above. Right-click it to rename it, or to hand it to FanDeck if it shows BIOS.";
     }
 
-    /// <summary>Puts the active profile's curve on the graph: editable for Silent/Balanced/Performance, a flat line for Max.</summary>
+    /// <summary>
+    /// Puts the selected fan's curve for the active profile on the graph (editable for Silent/Balanced/Performance,
+    /// a flat line for Max), with the other fans' curves faint behind it.
+    /// </summary>
     void ShowCurve()
     {
         var profile = _cfg.Profile;
-        bool editable = Profiles.HasCurve(profile);
-        IReadOnlyList<CurvePoint>? curve = editable ? _cfg.CurveFor(profile)
+        var fans = _last?.Fans.Where(f => f.Controlled).ToList() ?? [];
+        var selected = fans.FirstOrDefault(f => f.Id == _graphFan);
+        bool editable = Profiles.HasCurve(profile) && selected is not null;
+
+        IReadOnlyList<CurvePoint>? curve = editable ? _cfg.CurveFor(profile, selected!.Id)
             : profile == Profile.Max ? [new(Profiles.MinTemp, 100), new(Profiles.MaxTemp, 100)]
             : null;
-        _graph.SetCurve(curve, editable, Icons.ColorFor(profile));
+        var others = Profiles.HasCurve(profile)
+            ? fans.Where(f => f != selected).Select(f => (IReadOnlyList<CurvePoint>)_cfg.CurveFor(profile, f.Id)).ToList()
+            : [];
+        _graph.SetCurve(curve, editable, Icons.ColorFor(profile), others);
+
         _graphHint.Text = editable
-            ? "Drag a point to change the curve. Double-click to add one, right-click to remove."
+            ? $"Drag a point to change {selected!.Name}'s curve. Double-click to add one, right-click to remove."
             : profile == Profile.Max
                 ? "Max ignores temperature."
-                : "Manual ignores temperature. Set each fan with its slider below.";
-        _resetCurve.Visible = editable && _cfg.HasCustomCurve(profile);
+                : profile == Profile.Manual
+                    ? "Manual ignores temperature. Set each fan with its slider below."
+                    : "No fan for FanDeck to control yet.";
+        _resetCurve.Visible = editable && _cfg.HasCustomCurve(profile, selected!.Id);
+
+        bool wasSyncing = _syncing;
+        _syncing = true;
+        _source.Enabled = selected is not null;
+        _source.SelectedIndex = selected is null ? -1 : Array.IndexOf(TempSources.All, selected.Source);
+        _syncing = wasSyncing;
+    }
+
+    List<CurveGraph.LiveDot> LiveDots() => (_last?.Fans ?? [])
+        .Where(f => f.Controlled && f.SourceTemp is not null)
+        .Select(f => new CurveGraph.LiveDot(f.Name, f.SourceTemp!.Value, f.Percent, f.Id == _graphFan))
+        .ToList();
+
+    /// <summary>One toggle per fan FanDeck controls; the checked one is the fan the graph edits.</summary>
+    void BuildGraphFans(List<FanStatus> fans)
+    {
+        if (_graphFan is null || fans.All(f => f.Id != _graphFan))
+            _graphFan = fans.FirstOrDefault()?.Id;
+
+        _graphFans.SuspendLayout();
+        _graphFans.Controls.Clear();
+        foreach (var fan in fans)
+        {
+            string id = fan.Id;
+            var button = new RadioButton
+            {
+                Text = fan.Name,
+                Tag = id,
+                Appearance = Appearance.Button,
+                AutoSize = true,
+                FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Padding = Pad(8, 2, 8, 2),
+                Margin = Pad(0, 0, 6, 0),
+                Cursor = Cursors.Hand,
+                Checked = id == _graphFan,
+            };
+            button.FlatAppearance.BorderColor = Color.FromArgb(205, 205, 205);
+            button.FlatAppearance.CheckedBackColor = Color.FromArgb(222, 234, 252);
+            button.CheckedChanged += (_, _) =>
+            {
+                if (button.Checked && !_syncing)
+                    SelectGraphFan(id);
+            };
+            _graphFans.Controls.Add(button);
+        }
+        _graphFans.ResumeLayout();
+    }
+
+    void SelectGraphFan(string id)
+    {
+        if (_last?.Fans.Any(f => f.Id == id && f.Controlled) != true)
+            return;
+        _graphFan = id;
+        bool wasSyncing = _syncing;
+        _syncing = true;
+        foreach (RadioButton button in _graphFans.Controls)
+            button.Checked = (string?)button.Tag == id;
+        _syncing = wasSyncing;
+        ShowCurve();
+        _graph.SetLive(LiveDots());
     }
 
     void BuildFanRows(IReadOnlyList<FanStatus> fans)
@@ -338,6 +443,11 @@ sealed class MainForm : Form
                 Cursor = Cursors.Hand,
             };
             name.ContextMenuStrip = FanMenu(id);
+            name.Click += (_, e) =>
+            {
+                if (e is MouseEventArgs { Button: MouseButtons.Left })
+                    SelectGraphFan(id);
+            };
             var rpm = new Label { AutoSize = true, MinimumSize = new Size(Px(96), 0), TextAlign = ContentAlignment.MiddleRight, Anchor = AnchorStyles.Left };
             var pct = new Label { AutoSize = true, MinimumSize = new Size(Px(56), 0), TextAlign = ContentAlignment.MiddleRight, Anchor = AnchorStyles.Left };
             var slider = new TrackBar
@@ -380,16 +490,8 @@ sealed class MainForm : Form
         var menu = new ContextMenuStrip();
         var rename = new ToolStripMenuItem("Rename…", null, (_, _) => Rename(id));
         var control = new ToolStripMenuItem("Let FanDeck control this fan", null, (_, _) => ToggleControlled(id));
-        var cpuOnly = new ToolStripMenuItem("Follow CPU temperature only", null, (_, _) => SetFollowGpu(id, false));
-        var both = new ToolStripMenuItem("Follow CPU or GPU, whichever is hotter", null, (_, _) => SetFollowGpu(id, true));
-        menu.Items.AddRange([rename, control, new ToolStripSeparator(), cpuOnly, both]);
-        menu.Opening += (_, _) =>
-        {
-            var fan = _last?.Fans.FirstOrDefault(f => f.Id == id);
-            control.Checked = fan?.Controlled ?? false;
-            cpuOnly.Checked = fan is { FollowsGpu: false };
-            both.Checked = fan is { FollowsGpu: true };
-        };
+        menu.Items.AddRange([rename, control]);
+        menu.Opening += (_, _) => control.Checked = _last?.Fans.FirstOrDefault(f => f.Id == id)?.Controlled ?? false;
         return menu;
     }
 
@@ -402,13 +504,6 @@ sealed class MainForm : Form
                 "Control this fan?", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
             return;
         _cfg.Fan(id).Controlled = !controlled;
-        _cfg.Save();
-        _app.Loop?.Poke();
-    }
-
-    void SetFollowGpu(string id, bool followGpu)
-    {
-        _cfg.Fan(id).FollowGpu = followGpu;
         _cfg.Save();
         _app.Loop?.Poke();
     }

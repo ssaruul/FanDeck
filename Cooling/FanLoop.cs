@@ -2,9 +2,10 @@ using FanDeck.Hardware;
 
 namespace FanDeck.Cooling;
 
-/// <param name="SourceTemp">The temperature this fan follows (CPU, or the hotter of CPU and GPU).</param>
+/// <param name="Source">Which temperature this fan follows.</param>
+/// <param name="SourceTemp">That temperature right now.</param>
 public sealed record FanStatus(
-    string Id, string Name, float? Rpm, float Percent, bool Controlled, bool FollowsGpu, float Floor, float? SourceTemp);
+    string Id, string Name, float? Rpm, float Percent, bool Controlled, TempSource Source, float Floor, float? SourceTemp);
 
 public sealed record LoopSnapshot(
     float? CpuTemp, float? GpuTemp, Profile Profile, IReadOnlyList<FanStatus> Fans, string? Notice);
@@ -15,7 +16,7 @@ public sealed record LoopSnapshot(
 /// </summary>
 public sealed class FanLoop : IDisposable
 {
-    public const float CpuFloor = 25;   // % minimum for fans that cool the CPU
+    public const float CpuFloor = 25;   // % minimum for the CPU cooler, whatever temperature it follows
     public const float CaseFloor = 20;  // % minimum for every other fan
     const float PanicTemp = 95;         // the 7900X's limit: at or above this every fan runs flat out
     const float RampUpPerSecond = 10;
@@ -129,9 +130,9 @@ public sealed class FanLoop : IDisposable
             {
                 var settings = _cfg.Fan(ch.Id);
                 bool controlled = settings.Controlled ?? ch.ControlledByDefault;
-                bool followsGpu = settings.FollowGpu ?? !ch.IsCpuFan;
-                float floor = followsGpu ? CaseFloor : CpuFloor;
-                float? source = followsGpu && cpu is not null && gpu is not null ? Math.Max(cpu.Value, gpu.Value) : cpu;
+                var sourceKind = SourceOf(ch, settings);
+                float floor = ch.IsCpuFan ? CpuFloor : CaseFloor;
+                float? source = TempSources.Read(sourceKind, cpu, gpu);
                 float percent;
 
                 if (_fanServiceRunning || !controlled)
@@ -144,7 +145,7 @@ public sealed class FanLoop : IDisposable
                 }
                 else
                 {
-                    float target = Target(profile, settings, floor, cpu, source);
+                    float target = Target(profile, ch.Id, settings, floor, cpu, source);
                     float current = _output.TryGetValue(ch.Id, out float o) ? o : ch.Percent ?? target;
                     bool instant = profile is Profile.Manual or Profile.Max || cpu is null;
                     percent = instant ? target
@@ -155,7 +156,7 @@ public sealed class FanLoop : IDisposable
                 }
 
                 fans.Add(new FanStatus(
-                    ch.Id, settings.Name ?? ch.DisplayName, ch.Rpm, percent, controlled, followsGpu, floor, source));
+                    ch.Id, settings.Name ?? ch.DisplayName, ch.Rpm, percent, controlled, sourceKind, floor, source));
             }
 
             string? notice = _fanServiceRunning
@@ -165,14 +166,19 @@ public sealed class FanLoop : IDisposable
         }
     }
 
-    float Target(Profile profile, FanSettings settings, float floor, float? cpu, float? source)
+    /// <summary>The CPU cooler follows the CPU unless you choose otherwise; other fans follow the hotter of CPU and GPU.</summary>
+    public static TempSource SourceOf(FanChannel channel, FanSettings settings) =>
+        settings.Source ?? (channel.IsCpuFan ? TempSource.Cpu : TempSource.Hottest);
+
+    float Target(Profile profile, string fanId, FanSettings settings, float floor, float? cpu, float? source)
     {
-        // Can't read the CPU, or it's at its limit: full speed whatever the profile.
+        // Can't read the CPU, or it's at its limit: full speed whatever the profile,
+        // even for a fan that follows the GPU.
         if (cpu is null || source is null || cpu >= PanicTemp || profile == Profile.Max)
             return 100;
         if (profile == Profile.Manual)
             return Math.Clamp(settings.ManualPercent, floor, 100);
-        return Math.Max(floor, Profiles.Evaluate(_cfg.CurveFor(profile), source.Value));
+        return Math.Max(floor, Profiles.Evaluate(_cfg.CurveFor(profile, fanId), source.Value));
     }
 
     /// <summary>Average over the last few seconds, so short Ryzen temperature spikes don't rev the fans.</summary>

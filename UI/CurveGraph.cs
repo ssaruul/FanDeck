@@ -10,7 +10,8 @@ namespace FanDeck.UI;
 /// </summary>
 sealed class CurveGraph : Control
 {
-    public sealed record LiveDot(string Name, float Temp, float Percent);
+    /// <param name="Selected">The fan whose curve is being edited; its dot is drawn larger.</param>
+    public sealed record LiveDot(string Name, float Temp, float Percent, bool Selected = false);
 
     const float FloorPercent = 20;
     const float PanicTemp = 95;
@@ -18,6 +19,7 @@ sealed class CurveGraph : Control
         [Color.FromArgb(0x1F, 0x29, 0x37), Color.FromArgb(0x0E, 0x74, 0x90), Color.FromArgb(0x7C, 0x3A, 0xED)];
 
     List<CurvePoint>? _points;
+    IReadOnlyList<IReadOnlyList<CurvePoint>> _others = [];
     IReadOnlyList<LiveDot> _live = [];
     bool _editable;
     Color _accent = Color.SeaGreen;
@@ -34,12 +36,17 @@ sealed class CurveGraph : Control
         BackColor = Color.White;
     }
 
-    /// <summary>Shows a curve (null for none). Ignored mid-drag so the curve isn't pulled from under the mouse.</summary>
-    public void SetCurve(IReadOnlyList<CurvePoint>? points, bool editable, Color accent)
+    /// <summary>
+    /// Shows a curve (null for none), with the other fans' curves faint behind it.
+    /// Ignored mid-drag so the curve isn't pulled from under the mouse.
+    /// </summary>
+    public void SetCurve(IReadOnlyList<CurvePoint>? points, bool editable, Color accent,
+        IReadOnlyList<IReadOnlyList<CurvePoint>>? others = null)
     {
         if (_drag >= 0)
             return;
         _points = points?.ToList();
+        _others = others ?? [];
         _editable = editable && _points is not null;
         _accent = accent;
         if (_hover >= (_points?.Count ?? 0))
@@ -101,13 +108,20 @@ sealed class CurveGraph : Control
         using (var border = new Pen(Color.FromArgb(210, 210, 210)))
             g.DrawRectangle(border, plot);
 
+        using (var ghost = new Pen(Color.FromArgb(185, 185, 185), Px(1)) { DashStyle = DashStyle.Dash })
+        {
+            foreach (var other in _others.Where(o => o.Count > 0))
+                g.DrawLines(ghost, CurveLine(other).ToArray());
+        }
+
         if (_points is { Count: > 0 } pts)
             DrawCurve(g, pts, plot);
 
         // Fans at the same spot (often the CPU and chassis fan) share one dot and one label.
         var groups = _live
             .GroupBy(d => (Temp: MathF.Round(d.Temp), Percent: MathF.Round(d.Percent)))
-            .Select(grp => new LiveDot(string.Join(" + ", grp.Select(d => d.Name)), grp.Key.Temp, grp.Key.Percent))
+            .Select(grp => new LiveDot(
+                string.Join(" + ", grp.Select(d => d.Name)), grp.Key.Temp, grp.Key.Percent, grp.Any(d => d.Selected)))
             .ToList();
         var labels = new List<RectangleF>();
         for (int i = 0; i < groups.Count; i++)
@@ -121,11 +135,18 @@ sealed class CurveGraph : Control
         }
     }
 
-    void DrawCurve(Graphics g, List<CurvePoint> pts, Rectangle plot)
+    /// <summary>The curve as screen points, extended flat to both edges of the chart.</summary>
+    List<PointF> CurveLine(IReadOnlyList<CurvePoint> pts)
     {
         var line = new List<PointF> { new(X(Profiles.MinTemp), Y(pts[0].Percent)) };
         line.AddRange(pts.Select(p => new PointF(X(p.Temp), Y(p.Percent))));
         line.Add(new PointF(X(Profiles.MaxTemp), Y(pts[^1].Percent)));
+        return line;
+    }
+
+    void DrawCurve(Graphics g, List<CurvePoint> pts, Rectangle plot)
+    {
+        var line = CurveLine(pts);
 
         var area = line.Concat([new PointF(plot.Right, plot.Bottom), new PointF(plot.Left, plot.Bottom)]).ToArray();
         using (var fill = new SolidBrush(Color.FromArgb(34, _accent)))
@@ -150,7 +171,7 @@ sealed class CurveGraph : Control
     {
         float x = X(Math.Clamp(dot.Temp, Profiles.MinTemp, Profiles.MaxTemp));
         float y = Y(Math.Clamp(dot.Percent, 0, 100));
-        float r = Px(5);
+        float r = Px(dot.Selected ? 7 : 5);
         using var brush = new SolidBrush(color);
         using var halo = new Pen(Color.White, Px(2));
         g.DrawEllipse(halo, x - r, y - r, 2 * r, 2 * r);
